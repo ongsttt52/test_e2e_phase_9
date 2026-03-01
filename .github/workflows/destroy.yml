@@ -1,0 +1,146 @@
+name: Destroy AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        default: ''
+      delete_state_bucket:
+        description: 'Also delete Terraform state bucket? (yes/no)'
+        required: false
+        default: 'no'
+
+env:
+  AWS_REGION: ap-northeast-2
+  TERRAFORM_VERSION: 1.5.7
+
+jobs:
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "❌ Confirmation failed!"
+            echo "Please type 'destroy' to confirm"
+            exit 1
+          fi
+          echo "✅ Confirmation received"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        run: |
+          echo "🗑️  Starting infrastructure destruction..."
+          terraform destroy \
+            -var="project_name=test_e2e_phase_9" \
+            -var="environment=demo" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="django_secret_key=${{ secrets.DJANGO_SECRET_KEY }}" \
+            -var="django_superuser_email=admin@example.com" \
+            -var="django_superuser_password=${{ secrets.DJANGO_SUPERUSER_PASSWORD }}" \
+            -var="ec2_public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
+            -auto-approve
+
+          echo "✅ Infrastructure destroyed successfully!"
+
+      - name: Delete Terraform State Bucket
+        if: github.event.inputs.delete_state_bucket == 'yes'
+        env:
+          TF_STATE_BUCKET: test-e2e-phase-9-state-bucket
+        run: |
+          echo "🗑️  Deleting Terraform state bucket: $TF_STATE_BUCKET"
+
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            echo "⚠️  State bucket not found, skipping"
+            exit 0
+          fi
+
+          echo "  Removing all object versions..."
+          aws s3api list-object-versions \
+            --bucket "$TF_STATE_BUCKET" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          objects = data.get('Objects') or []
+          if objects:
+              for i in range(0, len(objects), 1000):
+                  batch = objects[i:i+1000]
+                  delete_payload = {'Objects': batch, 'Quiet': True}
+                  print(json.dumps(delete_payload))
+          " | while read -r payload; do
+            aws s3api delete-objects \
+              --bucket "$TF_STATE_BUCKET" \
+              --delete "$payload" 2>/dev/null || true
+          done
+
+          echo "  Removing all delete markers..."
+          aws s3api list-object-versions \
+            --bucket "$TF_STATE_BUCKET" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          objects = data.get('Objects') or []
+          if objects:
+              for i in range(0, len(objects), 1000):
+                  batch = objects[i:i+1000]
+                  delete_payload = {'Objects': batch, 'Quiet': True}
+                  print(json.dumps(delete_payload))
+          " | while read -r payload; do
+            aws s3api delete-objects \
+              --bucket "$TF_STATE_BUCKET" \
+              --delete "$payload" 2>/dev/null || true
+          done
+
+          aws s3api delete-bucket --bucket "$TF_STATE_BUCKET"
+          echo "✅ State bucket deleted"
+
+      - name: Summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️  All AWS resources have been destroyed"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Destroyed resources:"
+          echo "  - VPC and networking"
+          echo "  - S3 Bucket (if empty)"
+          echo "  - EC2 Instance and Elastic IP"
+          echo "  - EC2 Key Pair"
+          echo "  - IAM Instance Profile"
+          echo ""
+          if [ "${{ github.event.inputs.delete_state_bucket }}" = "yes" ]; then
+            echo "  - Terraform state bucket: test-e2e-phase-9-state-bucket (DELETED)"
+          else
+            echo "  ℹ️  Terraform state bucket preserved: test-e2e-phase-9-state-bucket"
+            echo "     To delete it, re-run this workflow with 'delete_state_bucket: yes'"
+          fi
+          echo ""
+          echo "Note: You may need to manually delete:"
+          echo "  - S3 bucket if it contains files"
+          echo "  - CloudWatch logs (optional)"
